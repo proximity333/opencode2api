@@ -6,5 +6,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-http://10.147.20.3:7890}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-http://10.147.20.3:7890}
     image: opencode2api:local
     pull_policy: never

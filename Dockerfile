@@ -4,6 +4,12 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
 
+# Build-time network settings, injected via compose build args.
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG GOPROXY=https://goproxy.cn,direct
+ENV HTTP_PROXY=${HTTP_PROXY} HTTPS_PROXY=${HTTPS_PROXY} GOPROXY=${GOPROXY}
+
 WORKDIR /src
 
 COPY go.mod go.sum ./

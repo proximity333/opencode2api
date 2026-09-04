@@ -986,6 +986,11 @@ func (emitter *bridgeStreamEmitter) startReasoning() error {
 		})
 	case ProtocolResponses:
 		emitter.reasoningItemID = randomID("rs", 12)
+		// This emitter only runs for transcoded streams (same-protocol
+		// streams are forwarded byte-for-byte), so the upstream was not
+		// Responses and this ID is gateway-minted. Register it so it is
+		// stripped if a client ever echoes it back in upstream input.
+		markFabricatedReasoningID(emitter.reasoningItemID)
 		emitter.reasoningOutput = emitter.nextOutput
 		emitter.nextOutput++
 		item := map[string]any{"id": emitter.reasoningItemID, "type": "reasoning", "status": "in_progress", "summary": []any{}}

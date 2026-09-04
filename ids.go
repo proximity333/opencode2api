@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 type requestIDs struct {
@@ -86,6 +87,56 @@ func stableID(prefix, value string) string {
 	sum := sha256.Sum256([]byte(prefix + "\x00" + value))
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
+
+// fabricatedReasoningIDs tracks Responses reasoning item IDs minted by the
+// gateway itself for downstream output. Upstream never issued them, so they
+// must never be sent back upstream: Responses servers dereference reasoning
+// item IDs against their own store and reject unknown ones with
+// "Referenced reasoning item ... was not found or has expired".
+var fabricatedReasoningIDs = newFabricatedIDSet(32768)
+
+type fabricatedIDSet struct {
+	mu    sync.Mutex
+	cap   int
+	ids   map[string]struct{}
+	order []string
+}
+
+func newFabricatedIDSet(capacity int) *fabricatedIDSet {
+	return &fabricatedIDSet{cap: capacity, ids: make(map[string]struct{})}
+}
+
+func (s *fabricatedIDSet) add(id string) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.ids[id]; ok {
+		return
+	}
+	s.ids[id] = struct{}{}
+	s.order = append(s.order, id)
+	for len(s.order) > s.cap {
+		oldest := s.order[0]
+		s.order = s.order[1:]
+		delete(s.ids, oldest)
+	}
+}
+
+func (s *fabricatedIDSet) has(id string) bool {
+	if id == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.ids[id]
+	return ok
+}
+
+func markFabricatedReasoningID(id string) { fabricatedReasoningIDs.add(id) }
+
+func isFabricatedReasoningID(id string) bool { return fabricatedReasoningIDs.has(id) }
 
 func randomID(prefix string, size int) string {
 	buf := make([]byte, size)

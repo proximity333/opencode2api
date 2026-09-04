@@ -113,8 +113,33 @@ func prepareUpstreamRequest(from, to Protocol, input map[string]any, upstreamURL
 	if err != nil {
 		return nil, err
 	}
+	if to == ProtocolResponses {
+		stripFabricatedReasoningIDs(output)
+	}
 	normalizeToolReasoningHistory(to, stringAt(output, "model"), upstreamURL, output)
 	return output, nil
+}
+
+// stripFabricatedReasoningIDs drops reasoning input items whose IDs were
+// minted by the gateway for downstream output (see markFabricatedReasoningID).
+// Clients legitimately echo those items in later turns; forwarding them would
+// make upstream reject the request with "Referenced reasoning item ... was
+// not found or has expired". Genuine upstream-issued IDs pass through, so
+// prompt caching on native Responses flows keeps working.
+func stripFabricatedReasoningIDs(output map[string]any) {
+	items, ok := output["input"].([]any)
+	if !ok {
+		return
+	}
+	kept := items[:0]
+	for _, raw := range items {
+		if item, ok := raw.(map[string]any); ok && stringAt(item, "type") == "reasoning" &&
+			isFabricatedReasoningID(stringAt(item, "id")) {
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	output["input"] = kept
 }
 
 // normalizeToolReasoningHistory applies only to endpoints that are known to
@@ -763,7 +788,11 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 			switch block.Kind {
 			case "reasoning":
 				flushContent()
-				items = append(items, encodeResponsesReasoning(block, false))
+				// encodeResponsesReasoning returns nil for history without a
+				// genuine upstream ID (see below); never send invented IDs.
+				if item := encodeResponsesReasoning(block, false); item != nil {
+					items = append(items, item)
+				}
 			case "text":
 				kind := "input_text"
 				if message.Role == "assistant" {
@@ -1043,9 +1072,21 @@ func decodeResponsesReasoning(item map[string]any) []bridgeBlock {
 }
 
 func encodeResponsesReasoning(block bridgeBlock, completed bool) map[string]any {
+	// completed=false encodes upstream INPUT, completed=true encodes
+	// downstream OUTPUT. Responses servers dereference reasoning item IDs
+	// against their own store, so upstream input must never carry a
+	// gateway-invented ID: only replay IDs that came from a genuine upstream
+	// Responses item, and drop anything else. Reasoning from Chat
+	// (reasoning_content) or Anthropic (thinking) history never has a genuine
+	// ID, so it is omitted from transcoded upstream input rather than sent
+	// with a fabricated one.
+	if block.ID == "" && !completed {
+		return nil
+	}
 	id := block.ID
 	if id == "" {
 		id = randomID("rs", 12)
+		markFabricatedReasoningID(id)
 	}
 	summary := []any{}
 	if block.Text != "" {

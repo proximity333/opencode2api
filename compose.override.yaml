@@ -1,0 +1,10 @@
+# Local development override (auto-loaded by `docker compose`).
+# Builds the image from this checkout so `docker compose up -d --build`
+# uses local code instead of pulling ghcr.io.
+services:
+  opencode2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: opencode2api:local
+    pull_policy: never

@@ -280,19 +280,6 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			meta.Tier = string(upstreamRoute.Tier)
 		}
 		w.Header().Set("x-request-id", ids.Request)
-		// Per-request route diagnostic: external vs upstream protocol tells
-		// whether this request was a byte-level passthrough or went through
-		// the bridge (transcode). session_header shows if the client sent a
-		// real x-opencode-session; without it the gateway falls back to a
-		// derived session that can drift between turns.
-		g.logger.Debug("inference route selected",
-			"component", "upstream", "event", "route_selected",
-			"request_id", ids.Request, "model", model,
-			"external", string(external), "upstream", string(upstreamRoute.Protocol),
-			"tier", upstreamRoute.Tier, "anonymous", upstreamRoute.Anonymous,
-			"transcoded", external != upstreamRoute.Protocol,
-			"session_header", r.Header.Get("x-opencode-session") != "",
-			"prev_response", stringAt(payload, "previous_response_id") != "")
 		if resp.StatusCode/100 != 2 {
 			copyErrorResponse(w, external, resp, ids.Request)
 			return

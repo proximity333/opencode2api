@@ -9,5 +9,8 @@ services:
       args:
         HTTP_PROXY: ${BUILD_HTTP_PROXY:-http://10.147.20.3:7890}
         HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-http://10.147.20.3:7890}
+        # Image fingerprint: build with VERSION=$(git rev-parse --short HEAD)
+        # so /healthz version proves which commit the running binary has.
+        VERSION: ${VERSION:-dev}
     image: opencode2api:local
     pull_policy: never

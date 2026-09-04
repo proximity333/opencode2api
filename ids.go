@@ -19,7 +19,13 @@ type requestIDs struct {
 }
 
 func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
-	signal := firstString(
+	// Explicit client session signal must be forwarded verbatim. Upstream
+	// uses x-opencode-session for prompt-cache and reasoning-item affinity
+	// (rs_* lookups are scoped to the session). Hashing or otherwise
+	// rewriting a real client session breaks that affinity and surfaces as
+	// "Referenced reasoning item ... was not found or has expired".
+	// Only derive-and-hash when the client sent no session at all.
+	rawSession := firstString(
 		r.Header.Get("x-opencode-session"),
 		r.Header.Get("x-session-affinity"),
 		r.Header.Get("X-Session-Id"),
@@ -28,18 +34,19 @@ func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
 		stringAt(body, "conversation_id"),
 		stringAt(body, "metadata", "session_id"),
 	)
-	if signal == "" {
-		// Using the first user turn keeps a multi-turn conversation stable as its
-		// history grows while separating conversations with different beginnings.
-		signal = conversationSeed(body)
+	var session string
+	if rawSession != "" {
+		session = strings.TrimSpace(rawSession)
+	} else {
+		signal := conversationSeed(body)
+		if signal == "" {
+			signal = stringAt(body, "previous_response_id")
+		}
+		if signal == "" || signal == `{}` {
+			signal = randomID("fallback", 16)
+		}
+		session = stableID("ses", signal)
 	}
-	if signal == "" {
-		signal = stringAt(body, "previous_response_id")
-	}
-	if signal == "" || signal == `{}` {
-		signal = randomID("fallback", 16)
-	}
-	session := stableID("ses", signal)
 	projectSignal := firstString(r.Header.Get("x-opencode-project"), stringAt(body, "metadata", "project_id"))
 	if projectSignal == "" {
 		projectSignal = "opencode2api:default-project"

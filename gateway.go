@@ -249,6 +249,21 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
 		}
+		ids := deriveRequestIDs(r, payload)
+		if meta != nil {
+			meta.Request = ids.Request
+		}
+		stream := boolAt(payload, "stream")
+		// Debug: log the client's reasoning params so we can tell whether
+		// opencode actually sent reasoning_effort/reasoning for this request.
+		// Without them upstream returns encrypted_content only.
+		g.logger.Debug("inference request reasoning",
+			"component", "upstream", "event", "request_reasoning",
+			"request_id", ids.Request, "model", model,
+			"external", string(external), "upstream", string(route.ProtocolFor(route.Tier)),
+			"reasoning_effort", payload["reasoning_effort"], "reasoning", payload["reasoning"],
+			"thinking", payload["thinking"], "effort", payload["effort"],
+			"stream", stream)
 		if meta != nil {
 			meta.Tier = string(route.Tier)
 		}
@@ -257,11 +272,6 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
 		}
-		ids := deriveRequestIDs(r, payload)
-		if meta != nil {
-			meta.Request = ids.Request
-		}
-		stream := boolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
 		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)

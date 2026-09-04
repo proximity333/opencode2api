@@ -758,7 +758,11 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 	if request.Reasoning != nil {
 		switch value := request.Reasoning.(type) {
 		case string:
-			output["reasoning"] = map[string]any{"effort": value}
+			// Responses requires reasoning.summary to return a plaintext
+			// summary. Chat clients only send an effort string, so default
+			// to "auto" here; without it upstream returns encrypted_content
+			// only and downstream can only show "[redacted thinking]".
+			output["reasoning"] = map[string]any{"effort": value, "summary": "auto"}
 		default:
 			output["reasoning"] = value
 		}

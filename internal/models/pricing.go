@@ -1,4 +1,4 @@
-package main
+package models
 
 import (
 	"context"
@@ -15,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"opencode2api/internal/httpx"
+	"opencode2api/internal/jsonutil"
 )
 
 const (
@@ -23,7 +26,7 @@ const (
 	modelsDevTimeout    = 30 * time.Second
 )
 
-type ModelPrice struct {
+type Price struct {
 	ID         string   `json:"id"`
 	Input      *float64 `json:"input_cost,omitempty"`
 	Output     *float64 `json:"output_cost,omitempty"`
@@ -50,13 +53,13 @@ type MetadataSnapshot struct {
 }
 
 type modelMetadataCache struct {
-	UpdatedAt time.Time             `json:"updated_at"`
-	Models    map[string]ModelPrice `json:"models"`
+	UpdatedAt time.Time        `json:"updated_at"`
+	Models    map[string]Price `json:"models"`
 }
 
-type modelMetadataStore struct {
+type PricingStore struct {
 	mu             sync.RWMutex
-	models         map[string]ModelPrice
+	models         map[string]Price
 	updatedAt      time.Time
 	lastError      string
 	cachePath      string
@@ -66,13 +69,13 @@ type modelMetadataStore struct {
 	logger         *slog.Logger
 }
 
-func newModelMetadataStore(configPath string, logger *slog.Logger) *modelMetadataStore {
+func NewPricingStore(configPath string, logger *slog.Logger) *PricingStore {
 	cachePath := ""
 	if configPath != "" {
 		cachePath = configPath + ".models.dev.json"
 	}
-	store := &modelMetadataStore{
-		models: make(map[string]ModelPrice), cachePath: cachePath, endpoint: modelsDevDefaultURL,
+	store := &PricingStore{
+		models: make(map[string]Price), cachePath: cachePath, endpoint: modelsDevDefaultURL,
 		client: &http.Client{Timeout: modelsDevTimeout}, logger: logger,
 	}
 	if err := store.loadCache(); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -84,13 +87,13 @@ func newModelMetadataStore(configPath string, logger *slog.Logger) *modelMetadat
 // SetClientProvider supplies candidate HTTP clients for refresh attempts, most
 // preferred first. It lets the periodic models.dev refresh ride the proxy
 // transports exposed by whichever gateway runtime is currently active.
-func (store *modelMetadataStore) SetClientProvider(provider func() []*http.Client) {
+func (store *PricingStore) SetClientProvider(provider func() []*http.Client) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.clientProvider = provider
 }
 
-func (store *modelMetadataStore) refreshClients() []*http.Client {
+func (store *PricingStore) refreshClients() []*http.Client {
 	store.mu.RLock()
 	provider := store.clientProvider
 	store.mu.RUnlock()
@@ -104,7 +107,7 @@ func (store *modelMetadataStore) refreshClients() []*http.Client {
 	return clients
 }
 
-func (store *modelMetadataStore) Start(ctx context.Context) {
+func (store *PricingStore) Start(ctx context.Context) {
 	go func() {
 		store.refreshAndLog(ctx)
 		ticker := time.NewTicker(modelsDevRefresh)
@@ -120,7 +123,7 @@ func (store *modelMetadataStore) Start(ctx context.Context) {
 	}()
 }
 
-func (store *modelMetadataStore) refreshAndLog(ctx context.Context) {
+func (store *PricingStore) refreshAndLog(ctx context.Context) {
 	if err := store.Refresh(ctx); err != nil {
 		if store.logger != nil {
 			store.logger.Warn("models.dev metadata refresh failed", "component", "models", "event", "metadata_refresh_failed", "error", err)
@@ -132,7 +135,7 @@ func (store *modelMetadataStore) refreshAndLog(ctx context.Context) {
 	}
 }
 
-func (store *modelMetadataStore) Refresh(ctx context.Context) error {
+func (store *PricingStore) Refresh(ctx context.Context) error {
 	var lastErr error
 	for _, client := range store.refreshClients() {
 		data, err := store.fetch(ctx, client)
@@ -162,7 +165,7 @@ func (store *modelMetadataStore) Refresh(ctx context.Context) error {
 	return store.recordError(lastErr)
 }
 
-func (store *modelMetadataStore) fetch(ctx context.Context, client *http.Client) ([]byte, error) {
+func (store *PricingStore) fetch(ctx context.Context, client *http.Client) ([]byte, error) {
 	refreshCtx, cancel := context.WithTimeout(ctx, modelsDevTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(refreshCtx, http.MethodGet, store.endpoint, nil)
@@ -170,7 +173,7 @@ func (store *modelMetadataStore) fetch(ctx context.Context, client *http.Client)
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("User-Agent", httpx.UserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -182,14 +185,14 @@ func (store *modelMetadataStore) fetch(ctx context.Context, client *http.Client)
 	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 }
 
-func (store *modelMetadataStore) recordError(err error) error {
+func (store *PricingStore) recordError(err error) error {
 	store.mu.Lock()
 	store.lastError = err.Error()
 	store.mu.Unlock()
 	return err
 }
 
-func (store *modelMetadataStore) Decide(model string) AnonymousDecision {
+func (store *PricingStore) Decide(model string) AnonymousDecision {
 	store.mu.RLock()
 	price, exists := store.models[model]
 	ready := !store.updatedAt.IsZero() && len(store.models) > 0
@@ -236,14 +239,14 @@ func (store *modelMetadataStore) Decide(model string) AnonymousDecision {
 	return decision
 }
 
-func (store *modelMetadataStore) Price(model string) (ModelPrice, bool) {
+func (store *PricingStore) Price(model string) (Price, bool) {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	price, ok := store.models[model]
 	return price, ok
 }
 
-func (store *modelMetadataStore) Snapshot() MetadataSnapshot {
+func (store *PricingStore) Snapshot() MetadataSnapshot {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	snapshot := MetadataSnapshot{Ready: !store.updatedAt.IsZero() && len(store.models) > 0, Models: len(store.models), LastError: store.lastError, CachePath: store.cachePath}
@@ -256,7 +259,7 @@ func (store *modelMetadataStore) Snapshot() MetadataSnapshot {
 	return snapshot
 }
 
-func (store *modelMetadataStore) loadCache() error {
+func (store *PricingStore) loadCache() error {
 	if store.cachePath == "" {
 		return nil
 	}
@@ -277,7 +280,7 @@ func (store *modelMetadataStore) loadCache() error {
 	return nil
 }
 
-func decodeModelsDev(data []byte) (map[string]ModelPrice, error) {
+func decodeModelsDev(data []byte) (map[string]Price, error) {
 	var providers map[string]json.RawMessage
 	if err := json.Unmarshal(data, &providers); err != nil {
 		return nil, fmt.Errorf("decode models.dev: %w", err)
@@ -302,21 +305,21 @@ func decodeModelsDev(data []byte) (map[string]ModelPrice, error) {
 			continue
 		}
 		if metadataProviderRank(key) == 1 {
-			identity := strings.ToLower(firstString(stringAt(provider, "id"), stringAt(provider, "name")))
+			identity := strings.ToLower(jsonutil.FirstString(jsonutil.StringAt(provider, "id"), jsonutil.StringAt(provider, "name")))
 			if !strings.Contains(identity, "opencode") {
 				continue
 			}
 		}
-		models := mapAt(provider, "models")
+		models := jsonutil.MapAt(provider, "models")
 		if len(models) == 0 {
 			continue
 		}
-		result := make(map[string]ModelPrice, len(models))
+		result := make(map[string]Price, len(models))
 		for id, raw := range models {
 			model, _ := raw.(map[string]any)
-			modelID := firstString(stringAt(model, "id"), id)
-			cost := mapAt(model, "cost")
-			result[modelID] = ModelPrice{
+			modelID := jsonutil.FirstString(jsonutil.StringAt(model, "id"), id)
+			cost := jsonutil.MapAt(model, "cost")
+			result[modelID] = Price{
 				ID: modelID, Input: numberPointer(cost, "input"), Output: numberPointer(cost, "output"), Deprecated: metadataDeprecated(model),
 			}
 		}
@@ -351,10 +354,10 @@ func numberPointer(object map[string]any, key string) *float64 {
 }
 
 func metadataDeprecated(model map[string]any) bool {
-	if boolAt(model, "deprecated") {
+	if jsonutil.BoolAt(model, "deprecated") {
 		return true
 	}
-	status := strings.ToLower(firstString(stringAt(model, "status"), stringAt(model, "lifecycle")))
+	status := strings.ToLower(jsonutil.FirstString(jsonutil.StringAt(model, "status"), jsonutil.StringAt(model, "lifecycle")))
 	if status == "deprecated" || status == "retired" || status == "disabled" {
 		return true
 	}

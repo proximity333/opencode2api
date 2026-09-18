@@ -1,312 +1,13 @@
-package main
+package telemetry
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
-	"net/http"
-	"net/url"
-	"os"
-	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"opencode2api/internal/protocol"
 )
-
-type LogEvent struct {
-	Sequence  uint64         `json:"sequence"`
-	Time      time.Time      `json:"time"`
-	Level     string         `json:"level"`
-	Message   string         `json:"message"`
-	Component string         `json:"component,omitempty"`
-	Fields    map[string]any `json:"fields,omitempty"`
-}
-
-type logSubscriber struct {
-	ch chan LogEvent
-}
-
-type LogHub struct {
-	mu          sync.RWMutex
-	buffer      []LogEvent
-	start       int
-	count       int
-	next        uint64
-	subscribers map[uint64]*logSubscriber
-	nextSub     uint64
-}
-
-func NewLogHub(capacity int) *LogHub {
-	if capacity < 100 {
-		capacity = 100
-	}
-	return &LogHub{buffer: make([]LogEvent, capacity), subscribers: make(map[uint64]*logSubscriber)}
-}
-
-func (h *LogHub) Resize(capacity int) {
-	if capacity < 100 {
-		capacity = 100
-	}
-	h.mu.Lock()
-	if capacity == len(h.buffer) {
-		h.mu.Unlock()
-		return
-	}
-	keep := min(h.count, capacity)
-	next := make([]LogEvent, capacity)
-	for i := 0; i < keep; i++ {
-		source := (h.start + h.count - keep + i) % len(h.buffer)
-		next[i] = h.buffer[source]
-	}
-	h.buffer, h.start, h.count = next, 0, keep
-	h.mu.Unlock()
-}
-
-func (h *LogHub) Publish(event LogEvent) {
-	h.mu.Lock()
-	h.next++
-	event.Sequence = h.next
-	if h.count < len(h.buffer) {
-		index := (h.start + h.count) % len(h.buffer)
-		h.buffer[index] = event
-		h.count++
-	} else {
-		h.buffer[h.start] = event
-		h.start = (h.start + 1) % len(h.buffer)
-	}
-	for _, sub := range h.subscribers {
-		select {
-		case sub.ch <- event:
-		default:
-			// A slow browser must never block request processing. Its reconnect
-			// cursor will make the gap visible on the next subscription.
-		}
-	}
-	h.mu.Unlock()
-}
-
-func (h *LogHub) Recent(after uint64, limit int) ([]LogEvent, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	if limit < 1 || limit > len(h.buffer) {
-		limit = len(h.buffer)
-	}
-	oldest := uint64(0)
-	if h.count > 0 {
-		oldest = h.buffer[h.start].Sequence
-	}
-	gap := after > 0 && oldest > 0 && after+1 < oldest
-	out := make([]LogEvent, 0, min(limit, h.count))
-	for i := 0; i < h.count; i++ {
-		event := h.buffer[(h.start+i)%len(h.buffer)]
-		if event.Sequence > after {
-			out = append(out, event)
-		}
-	}
-	if len(out) > limit {
-		out = out[len(out)-limit:]
-	}
-	return out, gap
-}
-
-func (h *LogHub) Subscribe() (<-chan LogEvent, func()) {
-	h.mu.Lock()
-	h.nextSub++
-	id := h.nextSub
-	sub := &logSubscriber{ch: make(chan LogEvent, 128)}
-	h.subscribers[id] = sub
-	h.mu.Unlock()
-	return sub.ch, func() {
-		h.mu.Lock()
-		delete(h.subscribers, id)
-		h.mu.Unlock()
-	}
-}
-
-type SecretRedactor struct {
-	values atomic.Value
-}
-
-func NewSecretRedactor() *SecretRedactor {
-	r := &SecretRedactor{}
-	r.values.Store([]string(nil))
-	return r
-}
-
-func (r *SecretRedactor) Replace(cfg Config) {
-	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.ZenKeys)+len(cfg.GoKeys)+2)
-	values = append(values, cfg.ServerKeys...)
-	values = append(values, cfg.ZenKeys...)
-	values = append(values, cfg.GoKeys...)
-	if cfg.WebUI.Password != "" {
-		values = append(values, cfg.WebUI.Password)
-	}
-	for _, value := range []string{cfg.Upstream.Zen, cfg.Upstream.Go} {
-		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
-			values = append(values, value, parsed.User.Username())
-			if password, ok := parsed.User.Password(); ok {
-				values = append(values, password)
-			}
-		}
-	}
-	for _, value := range cfg.RuntimeProxies() {
-		if value != "direct" {
-			values = append(values, value)
-			if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
-				values = append(values, parsed.User.Username())
-				if password, ok := parsed.User.Password(); ok {
-					values = append(values, password)
-				}
-			}
-		}
-	}
-	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
-	r.values.Store(values)
-}
-
-func (r *SecretRedactor) String(value string) string {
-	for _, secret := range r.values.Load().([]string) {
-		if len(secret) >= 4 {
-			value = strings.ReplaceAll(value, secret, "***")
-		}
-	}
-	return value
-}
-
-type hubHandler struct {
-	base     slog.Handler
-	hub      *LogHub
-	redactor *SecretRedactor
-	attrs    []slog.Attr
-	groups   []string
-}
-
-func NewStructuredLogger(level *slog.LevelVar, hub *LogHub, redactor *SecretRedactor) *slog.Logger {
-	return newStructuredLogger(os.Stdout, level, hub, redactor)
-}
-
-func newStructuredLogger(output io.Writer, level *slog.LevelVar, hub *LogHub, redactor *SecretRedactor) *slog.Logger {
-	base := slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level, ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
-		return sanitizeLogAttr(redactor, attr)
-	}})
-	return slog.New(&hubHandler{base: base, hub: hub, redactor: redactor})
-}
-
-func sanitizeLogAttr(redactor *SecretRedactor, attr slog.Attr) slog.Attr {
-	attr.Value = attr.Value.Resolve()
-	lower := strings.ToLower(attr.Key)
-	if strings.Contains(lower, "password") || strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "secret") {
-		return slog.String(attr.Key, "***")
-	}
-	switch attr.Value.Kind() {
-	case slog.KindString:
-		attr.Value = slog.StringValue(redactor.String(attr.Value.String()))
-	case slog.KindAny:
-		if err, ok := attr.Value.Any().(error); ok {
-			attr.Value = slog.StringValue(redactor.String(err.Error()))
-		}
-	}
-	return attr
-}
-
-func (h *hubHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.base.Enabled(ctx, level)
-}
-
-func (h *hubHandler) Handle(ctx context.Context, record slog.Record) error {
-	if err := h.base.Handle(ctx, record); err != nil {
-		return err
-	}
-	fields := make(map[string]any, record.NumAttrs()+len(h.attrs))
-	for _, attr := range h.attrs {
-		h.addAttr(fields, attr)
-	}
-	record.Attrs(func(attr slog.Attr) bool {
-		h.addAttr(fields, attr)
-		return true
-	})
-	component, _ := fields["component"].(string)
-	delete(fields, "component")
-	h.hub.Publish(LogEvent{
-		Time:      record.Time.UTC(),
-		Level:     strings.ToLower(record.Level.String()),
-		Message:   h.redactor.String(record.Message),
-		Component: component,
-		Fields:    fields,
-	})
-	return nil
-}
-
-func (h *hubHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	clone := *h
-	clone.base = h.base.WithAttrs(attrs)
-	clone.attrs = append(append([]slog.Attr(nil), h.attrs...), attrs...)
-	return &clone
-}
-
-func (h *hubHandler) WithGroup(name string) slog.Handler {
-	clone := *h
-	clone.base = h.base.WithGroup(name)
-	clone.groups = append(append([]string(nil), h.groups...), name)
-	return &clone
-}
-
-func (h *hubHandler) addAttr(fields map[string]any, attr slog.Attr) {
-	attr.Value = attr.Value.Resolve()
-	key := attr.Key
-	if len(h.groups) > 0 {
-		key = strings.Join(append(append([]string(nil), h.groups...), key), ".")
-	}
-	lower := strings.ToLower(key)
-	if strings.Contains(lower, "password") || strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "secret") {
-		fields[key] = "***"
-		return
-	}
-	var value any
-	switch attr.Value.Kind() {
-	case slog.KindString:
-		value = h.redactor.String(attr.Value.String())
-	case slog.KindInt64:
-		value = attr.Value.Int64()
-	case slog.KindUint64:
-		value = attr.Value.Uint64()
-	case slog.KindFloat64:
-		value = attr.Value.Float64()
-	case slog.KindBool:
-		value = attr.Value.Bool()
-	case slog.KindDuration:
-		value = attr.Value.Duration().String()
-	case slog.KindTime:
-		value = attr.Value.Time().UTC()
-	default:
-		value = h.redactor.String(fmt.Sprint(attr.Value.Any()))
-	}
-	fields[key] = value
-}
-
-type requestMeta struct {
-	Model         string
-	Tier          string
-	Request       string
-	KeyID         string
-	Channel       string
-	Anonymous     bool
-	Proxy         string
-	Attempts      int
-	Stream        bool
-	Usage         bridgeUsage
-	UsageReported bool
-}
-
-type requestMetaKey struct{}
-
-func metaFromRequest(r *http.Request) *requestMeta {
-	meta, _ := r.Context().Value(requestMetaKey{}).(*requestMeta)
-	return meta
-}
 
 type metricBucket struct {
 	minute        int64
@@ -547,11 +248,18 @@ func NewMonitor() *Monitor {
 	}
 }
 
+// BeginStream records a stream entering its response body phase.
+func (m *Monitor) BeginStream() { m.activeStreams.Add(1) }
+
+// EndStream releases a stream recorded by BeginStream.
+func (m *Monitor) EndStream() { m.activeStreams.Add(-1) }
+
 var latencyBounds = [...]uint64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000}
 
-func (m *Monitor) Record(endpoint string, status int, duration time.Duration, meta *requestMeta) {
+func (m *Monitor) Record(endpoint string, status int, duration time.Duration, meta *RequestMeta) {
+	success := requestSucceeded(status, meta)
 	m.total.Add(1)
-	if status >= 200 && status < 400 {
+	if success {
 		m.success.Add(1)
 	} else {
 		m.errors.Add(1)
@@ -563,7 +271,7 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		bucket.reset(minute)
 	}
 	bucket.total++
-	if status >= 200 && status < 400 {
+	if success {
 		bucket.success++
 	} else {
 		bucket.errors++
@@ -605,7 +313,7 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 				Time: time.Now().UTC(), RequestID: meta.Request, Model: meta.Model, Tier: meta.Tier,
 				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy,
 				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
-				Success: status >= 200 && status < 400,
+				Success: success,
 			}
 			if request.Channel == "" {
 				request.Channel = "not_routed"
@@ -614,11 +322,20 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 				request.KeyID = "anonymous"
 			}
 			request.Outcome = requestOutcome(status, request.Channel)
+			if meta.Outcome != "" {
+				request.Outcome = meta.Outcome
+			}
 			m.recentRequests.PruneBefore(request.Time.Add(-time.Hour))
 			m.recentRequests.Add(request)
 		}
 	}
 	m.mu.Unlock()
+}
+
+// A stream can fail after HTTP headers have been sent. Preserve its HTTP
+// status while using the terminal result for request success and error counts.
+func requestSucceeded(status int, meta *RequestMeta) bool {
+	return status >= 200 && status < 400 && (meta == nil || meta.Outcome == "")
 }
 
 func requestOutcome(status int, channel string) string {
@@ -781,7 +498,7 @@ func newUsagePeriod() UsagePeriod {
 	return UsagePeriod{Models: make(map[string]TokenCounts), Tiers: make(map[string]TokenCounts)}
 }
 
-func tokenCounts(usage bridgeUsage) TokenCounts {
+func tokenCounts(usage protocol.Usage) TokenCounts {
 	return TokenCounts{
 		Input: uint64(max(usage.Input, 0)), Output: uint64(max(usage.Output, 0)),
 		Cached: uint64(max(usage.Cached, 0)), Reasoning: uint64(max(usage.Reasoning, 0)), Total: uint64(max(usage.Total, 0)),
@@ -900,95 +617,4 @@ func histogramPercentile(histogram [11]uint64, total uint64, percentile float64)
 		}
 	}
 	return 0
-}
-
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-	bytes  int64
-}
-
-func (w *statusWriter) WriteHeader(status int) {
-	if w.status != 0 {
-		return
-	}
-	w.status = status
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *statusWriter) Write(data []byte) (int, error) {
-	if w.status == 0 {
-		w.WriteHeader(http.StatusOK)
-	}
-	n, err := w.ResponseWriter.Write(data)
-	w.bytes += int64(n)
-	return n, err
-}
-
-func (w *statusWriter) Flush() {
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
-}
-
-func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-func monitorMiddleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		started := time.Now()
-		meta := &requestMeta{}
-		r = r.WithContext(context.WithValue(r.Context(), requestMetaKey{}, meta))
-		writer := &statusWriter{ResponseWriter: w}
-		monitor.active.Add(1)
-		defer func() {
-			monitor.active.Add(-1)
-			status := writer.status
-			if status == 0 {
-				status = http.StatusOK
-			}
-			duration := time.Since(started)
-			monitor.Record(r.URL.Path, status, duration, meta)
-			if meta.Channel != "" {
-				logger.Info("request routed", "component", "http", "event", "request_routed", "method", r.Method,
-					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
-					"model", meta.Model, "tier", meta.Tier, "key_id", meta.KeyID, "channel", meta.Channel,
-					"anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream)
-			}
-			logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
-				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
-				"request_id", meta.Request, "model", meta.Model, "tier", meta.Tier, "key_id", meta.KeyID,
-				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream)
-		}()
-		next.ServeHTTP(writer, r)
-	})
-}
-
-func setLogLevel(level *slog.LevelVar, value string) {
-	switch value {
-	case "debug":
-		level.Set(slog.LevelDebug)
-	case "warn":
-		level.Set(slog.LevelWarn)
-	case "error":
-		level.Set(slog.LevelError)
-	default:
-		level.Set(slog.LevelInfo)
-	}
-}
-
-func encodeSSE(w http.ResponseWriter, event string, id uint64, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	if id > 0 {
-		_, _ = fmt.Fprintf(w, "id: %d\n", id)
-	}
-	if event != "" {
-		_, _ = fmt.Fprintf(w, "event: %s\n", event)
-	}
-	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
-	return err
 }

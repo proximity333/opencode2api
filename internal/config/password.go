@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"crypto/rand"
@@ -20,7 +20,7 @@ const (
 	argonKeyLength   = 32
 )
 
-func hashPassword(password string) (string, error) {
+func HashPassword(password string) (string, error) {
 	if len(password) < 10 {
 		return "", errors.New("webui password must contain at least 10 characters")
 	}
@@ -33,7 +33,7 @@ func hashPassword(password string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(hash)), nil
 }
 
-func verifyPassword(encoded, password string) bool {
+func VerifyPassword(encoded, password string) bool {
 	parts := strings.Split(encoded, "$")
 	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
 		return false

@@ -1,17 +1,18 @@
-package main
+// Package config loads, validates, persists, and redacts service configuration.
+package config
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
+	"time"
+
+	"opencode2api/internal/jsonutil"
+	wire "opencode2api/internal/protocol"
 )
 
 type Config struct {
@@ -51,6 +52,10 @@ type ModelsConfig struct {
 type LoggingConfig struct {
 	Level    string `json:"level"`
 	RingSize int    `json:"ring_size"`
+	// DumpRequestBodies logs the exact bytes sent upstream (redacted, capped)
+	// so retry and translation problems can be diagnosed without patching the
+	// binary. Off by default: the bodies contain conversation content.
+	DumpRequestBodies bool `json:"dump_request_bodies"`
 }
 
 type WebUIConfig struct {
@@ -69,9 +74,32 @@ type PerformanceConfig struct {
 	IdleConnTimeoutSeconds int `json:"idle_conn_timeout_seconds"`
 	ConnectTimeoutSeconds  int `json:"connect_timeout_seconds"`
 	FailureCooldownSeconds int `json:"failure_cooldown_seconds"`
+	AttemptTimeoutSeconds  int `json:"attempt_timeout_seconds"`
 }
 
-func LoadConfig(path string) (Config, error) {
+// AttemptTimeout bounds how long a single upstream attempt may wait for
+// response headers before it is abandoned and the next node is tried. Values
+// <= 0 keep the historical behavior of using the request-level retry timeout,
+// so existing configs are unaffected. The result never exceeds requestTimeout,
+// and only the header wait is bounded: an established stream keeps flowing
+// under the request-level timeout.
+//
+// The bound is installed on the shared transports, so it covers every attempt
+// in both the anonymous and the authenticated loops. Without it, one hung exit
+// can consume the entire request budget by itself, and the attempts that follow
+// are fired against an already-expired context.
+func (cfg PerformanceConfig) AttemptTimeout(requestTimeout time.Duration) time.Duration {
+	if cfg.AttemptTimeoutSeconds > 0 {
+		attempt := time.Duration(cfg.AttemptTimeoutSeconds) * time.Second
+		if requestTimeout > 0 && attempt > requestTimeout {
+			return requestTimeout
+		}
+		return attempt
+	}
+	return requestTimeout
+}
+
+func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read %s: %w", path, err)
@@ -95,15 +123,15 @@ func LoadConfig(path string) (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if err := ensureJSONEOF(dec); err != nil {
+	if err := jsonutil.EnsureEOF(dec); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
-	return NormalizeConfig(path, cfg)
+	return Normalize(path, cfg)
 }
 
-// NormalizeConfig resolves external inputs and validates a Config supplied by
+// Normalize resolves external inputs and validates a Config supplied by
 // either the JSON file or the authenticated management API.
-func NormalizeConfig(path string, cfg Config) (Config, error) {
+func Normalize(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
@@ -143,6 +171,9 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Performance.MaxIdleConns < 1 || cfg.Performance.MaxIdleConnsPerHost < 1 || cfg.Performance.MaxConnsPerHost < 0 || cfg.Performance.IdleConnTimeoutSeconds < 1 || cfg.Performance.ConnectTimeoutSeconds < 1 || cfg.Performance.FailureCooldownSeconds < 1 {
 		return Config{}, errors.New("performance values must be positive (max_conns_per_host may be zero for unlimited)")
 	}
+	if cfg.Performance.AttemptTimeoutSeconds < 0 {
+		return Config{}, errors.New("performance.attempt_timeout_seconds must not be negative (0 keeps the retry timeout)")
+	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
 	}
@@ -174,7 +205,7 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		}
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" {
-			return Config{}, fmt.Errorf("invalid proxy URL %q", redactURL(raw))
+			return Config{}, fmt.Errorf("invalid proxy URL %q", RedactURL(raw))
 		}
 		switch strings.ToLower(u.Scheme) {
 		case "http", "https", "socks5", "socks5h":
@@ -183,7 +214,7 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		}
 	}
 	for model, protocol := range cfg.Models.Protocols {
-		if model == "" || !validProtocol(Protocol(protocol)) {
+		if model == "" || !wire.Valid(wire.Protocol(protocol)) {
 			return Config{}, fmt.Errorf("models.protocols contains invalid mapping %q: %q", model, protocol)
 		}
 	}
@@ -203,262 +234,24 @@ func (cfg Config) RuntimeProxies() []string {
 	return []string{"direct"}
 }
 
-func ensureJSONEOF(dec *json.Decoder) error {
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
-		}
-		return err
-	}
-	return nil
-}
-
-// stripJSONComments removes // and /* */ comments without changing newlines,
-// so syntax errors still point at the correct line in config.json. Comment
-// markers inside JSON strings (for example, https:// URLs) are preserved.
-func stripJSONComments(data []byte) ([]byte, error) {
-	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
-	out := make([]byte, 0, len(data))
-	inString := false
-	escaped := false
-	lineComment := false
-	blockComment := false
-
-	for i := 0; i < len(data); i++ {
-		current := data[i]
-		if lineComment {
-			if current == '\n' || current == '\r' {
-				lineComment = false
-				out = append(out, current)
-			} else {
-				out = append(out, ' ')
-			}
-			continue
-		}
-		if blockComment {
-			if current == '*' && i+1 < len(data) && data[i+1] == '/' {
-				out = append(out, ' ', ' ')
-				i++
-				blockComment = false
-			} else if current == '\n' || current == '\r' {
-				out = append(out, current)
-			} else {
-				out = append(out, ' ')
-			}
-			continue
-		}
-		if inString {
-			out = append(out, current)
-			if escaped {
-				escaped = false
-			} else if current == '\\' {
-				escaped = true
-			} else if current == '"' {
-				inString = false
-			}
-			continue
-		}
-
-		switch {
-		case current == '"':
-			inString = true
-			out = append(out, current)
-		case current == '/' && i+1 < len(data) && data[i+1] == '/':
-			lineComment = true
-			out = append(out, ' ', ' ')
-			i++
-		case current == '/' && i+1 < len(data) && data[i+1] == '*':
-			blockComment = true
-			out = append(out, ' ', ' ')
-			i++
-		default:
-			out = append(out, current)
-		}
-	}
-	if blockComment {
-		return nil, errors.New("unterminated block comment")
-	}
-	return out, nil
-}
-
-func resolveProxyFiles(configPath string, cfg *Config) error {
-	trimList(&cfg.Proxies)
-	effective := append([]string(nil), cfg.Proxies...)
-	if cfg.ProxyFile != "" {
-		resolved := cfg.ProxyFile
-		if !filepath.IsAbs(resolved) {
-			resolved = filepath.Join(filepath.Dir(configPath), resolved)
-		}
-		proxies, err := readProxyFile(resolved)
-		if err != nil {
-			return fmt.Errorf("load proxy file %s: %w", resolved, err)
-		}
-		effective = append(effective, proxies...)
-	}
-
-	effective = uniqueStrings(effective)
-	if len(effective) == 0 {
-		effective = []string{"direct"}
-	}
-	cfg.effectiveProxies = effective
-	return nil
-}
-
-// SaveConfigAtomic writes normalized JSON and keeps the preceding file as
-// config.json.bak. The temporary file is created beside the target so the
-// final rename stays on the same filesystem.
-func SaveConfigAtomic(path string, cfg Config) error {
-	cfg.PasswordForSave()
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
-	data = append(data, '\n')
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, ".config-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temporary config: %w", err)
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	if _, err = temp.Write(data); err == nil {
-		err = temp.Sync()
-	}
-	closeErr := temp.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("write temporary config: %w", err)
-	}
-	if info, statErr := os.Stat(path); statErr == nil {
-		_ = os.Chmod(tempPath, info.Mode().Perm())
-	}
-
-	backup := path + ".bak"
-	if runtime.GOOS == "windows" {
-		_ = os.Remove(backup)
-		if _, statErr := os.Stat(path); statErr == nil {
-			if err := os.Rename(path, backup); err != nil {
-				return fmt.Errorf("backup config: %w", err)
-			}
-		}
-		if err := os.Rename(tempPath, path); err != nil {
-			_ = os.Rename(backup, path)
-			return fmt.Errorf("replace config: %w", err)
-		}
-		return nil
-	}
-	if _, statErr := os.Stat(path); statErr == nil {
-		if err := copyFile(path, backup); err != nil {
-			return fmt.Errorf("backup config: %w", err)
-		}
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("replace config: %w", err)
-	}
-	return nil
-}
-
 // PasswordForSave ensures resolved-only data is excluded. The method is kept
 // separate to make accidental persistence of effective proxy values obvious.
 func (cfg *Config) PasswordForSave() {
 	cfg.effectiveProxies = nil
 }
 
-func copyFile(source, target string) error {
-	in, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	mode := os.FileMode(0600)
-	if info, statErr := in.Stat(); statErr == nil {
-		mode = info.Mode().Perm()
-	}
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
-	if err != nil {
-		return err
-	}
-	_ = out.Chmod(mode)
-	_, copyErr := io.Copy(out, in)
-	syncErr := out.Sync()
-	closeErr := out.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
-}
-
-func readProxyFile(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var proxies []string
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	for scanner.Scan() {
-		value := strings.TrimSpace(strings.TrimPrefix(scanner.Text(), "\ufeff"))
-		value = strings.TrimSpace(stripProxyLineComment(value))
-		if value != "" {
-			proxies = append(proxies, value)
+func Clone(cfg Config) Config {
+	cfg.ServerKeys = append([]string(nil), cfg.ServerKeys...)
+	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
+	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
+	cfg.Proxies = append([]string(nil), cfg.Proxies...)
+	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
+	if cfg.Models.Protocols != nil {
+		protocols := make(map[string]string, len(cfg.Models.Protocols))
+		for key, value := range cfg.Models.Protocols {
+			protocols[key] = value
 		}
+		cfg.Models.Protocols = protocols
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return proxies, nil
-}
-
-func stripProxyLineComment(line string) string {
-	for i := 0; i < len(line); i++ {
-		if i > 0 && line[i-1] != ' ' && line[i-1] != '\t' {
-			continue
-		}
-		if line[i] == '#' || line[i] == ';' || (line[i] == '/' && i+1 < len(line) && line[i+1] == '/') {
-			return line[:i]
-		}
-	}
-	return line
-}
-
-func uniqueStrings(items []string) []string {
-	out := items[:0]
-	seen := make(map[string]struct{}, len(items))
-	for _, item := range items {
-		if _, exists := seen[item]; exists {
-			continue
-		}
-		seen[item] = struct{}{}
-		out = append(out, item)
-	}
-	return out
-}
-
-func trimList(items *[]string) {
-	out := (*items)[:0]
-	for _, item := range *items {
-		if value := strings.TrimSpace(item); value != "" {
-			out = append(out, value)
-		}
-	}
-	*items = out
-}
-
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<invalid>"
-	}
-	if u.User != nil {
-		u.User = url.User("***")
-	}
-	return u.String()
+	return cfg
 }

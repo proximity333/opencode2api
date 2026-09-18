@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 \
     go build \
       -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
-      -o /out/opencode2api ./
+      -o /out/opencode2api ./cmd/opencode2api
 
 FROM alpine:3.22
 
@@ -37,10 +37,12 @@ COPY --from=builder /out/opencode2api /usr/local/bin/opencode2api
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 COPY --chown=opencode2api:opencode2api config.example.json /app/config.example.json
 
+# LISTEN_ADDRESS / WEBUI_LISTEN_ADDRESS are intentionally unset: config.json is
+# authoritative. Export them to override the configured listen addresses.
 ENV CONFIG_PATH=/var/lib/opencode2api/config.json \
     CONFIG_SEED_PATH= \
-    LISTEN_ADDRESS=0.0.0.0:8080 \
-    WEBUI_LISTEN_ADDRESS=0.0.0.0:8081 \
+    LISTEN_ADDRESS= \
+    WEBUI_LISTEN_ADDRESS= \
     STATE_DIR=/var/lib/opencode2api
 
 WORKDIR /app

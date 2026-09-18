@@ -1,4 +1,4 @@
-package main
+package gateway
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"math/rand/v2"
+	rand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +16,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"opencode2api/internal/config"
+	"opencode2api/internal/httpx"
 )
 
 type proxyTransport struct {
@@ -147,7 +150,7 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 	return len(p.items), healthy
 }
 
-func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
+func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
 	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -166,7 +169,7 @@ func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTim
 		} else {
 			u, err := url.Parse(raw)
 			if err != nil {
-				return nil, fmt.Errorf("parse proxy %s: %w", redactURL(raw), err)
+				return nil, fmt.Errorf("parse proxy %s: %w", config.RedactURL(raw), err)
 			}
 			transport.Proxy = http.ProxyURL(u)
 		}
@@ -220,7 +223,7 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	defer cancel()
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
 	if err == nil {
-		req.Header.Set("User-Agent", opencodeUserAgent())
+		req.Header.Set("User-Agent", httpx.UserAgent())
 		resp, requestErr := proxy.client.Do(req)
 		err = requestErr
 		if resp != nil {
@@ -327,6 +330,20 @@ func (p *nodePool) RestoreProxy(recoveredProxy int) int {
 }
 
 func (p *nodePool) Len() int { return len(p.nodes) }
+
+// NodeByID resolves a node by its stable fingerprint. Callers only ever hold
+// the fingerprint, never the key value, so the lookup cannot leak a secret.
+func (p *nodePool) NodeByID(id string) *upstreamNode {
+	if p == nil || id == "" {
+		return nil
+	}
+	for _, node := range p.nodes {
+		if config.Fingerprint(node.key) == id {
+			return node
+		}
+	}
+	return nil
+}
 
 func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
 	if p == nil || node == nil || p.transports == nil {
@@ -478,12 +495,4 @@ func parseRetryAfter(value string) time.Duration {
 		return max(time.Until(when), 0)
 	}
 	return 0
-}
-
-func drainAndClose(body io.ReadCloser) {
-	if body == nil {
-		return
-	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
-	_ = body.Close()
 }

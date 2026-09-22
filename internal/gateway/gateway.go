@@ -217,7 +217,9 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
-		if upstreamRoute.Anonymous {
+		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
+			// Key-tier shaped requests were force-streamed like the
+			// anonymous lane; collapse the same way.
 			// The anonymous lane is served streaming (see forceStreamBody);
 			// collapse the events back into the single document this
 			// non-streaming client asked for.
@@ -280,6 +282,9 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 				continue
 			}
 			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+		}
+		if effort := g.cfg.ForcedEffort(jsonutil.StringAt(upstreamPayload, "model")); effort != "" {
+			wire.ForcedEffort(protocol, upstreamPayload, effort)
 		}
 		encoded, err := json.Marshal(upstreamPayload)
 		if err != nil {
